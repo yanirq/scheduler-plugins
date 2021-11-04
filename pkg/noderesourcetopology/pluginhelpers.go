@@ -19,9 +19,11 @@ package noderesourcetopology
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
@@ -30,6 +32,28 @@ import (
 	topologyinformers "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions"
 	listerv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/listers/topology/v1alpha1"
 )
+
+func handleKubeClientConfig(kubeconfig, masterOverride string) (*rest.Config, error) {
+	if kubeconfig == "" {
+		kubeconfig = os.Getenv("KUBECONFIG")
+		klog.InfoS("Using kubeconfig from env", "kubeconfig", kubeconfig)
+	}
+
+	var config *rest.Config
+	var err error
+	if kubeconfig != "" {
+		klog.InfoS("Loading kube client config from path", "path", kubeconfig, "masterOverride", masterOverride)
+		config, err = clientcmd.BuildConfigFromFlags(masterOverride, kubeconfig)
+	} else {
+		klog.InfoS("Using in-cluster kube client config")
+		config, err = rest.InClusterConfig()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not get the client: %v", err)
+	}
+
+	return config, nil
+}
 
 func findNodeTopology(nodeName string, nodeResTopoPlugin *nodeResTopologyPlugin) *topologyv1alpha1.NodeResourceTopology {
 	klog.V(5).InfoS("Namespaces for nodeResTopoPlugin", "namespaces", nodeResTopoPlugin.namespaces)
@@ -50,7 +74,7 @@ func findNodeTopology(nodeName string, nodeResTopoPlugin *nodeResTopologyPlugin)
 }
 
 func initNodeTopologyInformer(masterOverride, kubeConfigPath *string) (*listerv1alpha1.NodeResourceTopologyLister, error) {
-	kubeConfig, err := clientcmd.BuildConfigFromFlags(*masterOverride, *kubeConfigPath)
+	kubeConfig, err := handleKubeClientConfig(*kubeConfigPath, *masterOverride)
 	if err != nil {
 		klog.ErrorS(err, "Cannot create kubeconfig", "masterOverride", *masterOverride, "kubeConfigPath", *kubeConfigPath)
 		return nil, err
