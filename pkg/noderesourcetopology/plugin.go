@@ -21,12 +21,16 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	apiconfig "sigs.k8s.io/scheduler-plugins/pkg/apis/config"
 
 	topologyv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
-	listerv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/listers/topology/v1alpha1"
+	topoclientset "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
+	topologyinformers "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions"
+	informerv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions/topology/v1alpha1"
 )
 
 type NUMANode struct {
@@ -37,8 +41,10 @@ type NUMANode struct {
 type NUMANodeList []NUMANode
 
 type nodeResTopologyPlugin struct {
-	lister     *listerv1alpha1.NodeResourceTopologyLister
-	namespaces []string
+	factory      topologyinformers.SharedInformerFactory
+	informer     informerv1alpha1.NodeResourceTopologyInformer
+	stopChan     chan struct{}
+	topologyInfo *TopologyInfoMap
 }
 
 type tmScopeHandler struct {
@@ -91,10 +97,71 @@ func New(args runtime.Object, handle framework.Handle) (framework.Plugin, error)
 	if !ok {
 		return nil, fmt.Errorf("want args to be of type NodeResourceTopologyMatchArgs, got %T", args)
 	}
-	lister, err := initNodeTopologyInformer(&tcfg.MasterOverride, &tcfg.KubeConfigPath)
+
+	kubeConfig, err := clientcmd.BuildConfigFromFlags(tcfg.MasterOverride, tcfg.KubeConfigPath)
 	if err != nil {
+		klog.ErrorS(err, "Cannot create kubeconfig", "masterOverride", tcfg.MasterOverride, "kubeConfigPath", tcfg.KubeConfigPath)
 		return nil, err
 	}
+
+	topoClient, err := topoclientset.NewForConfig(kubeConfig)
+	if err != nil {
+		klog.ErrorS(err, "Cannot create clientset for NodeTopologyResource", "kubeConfig", kubeConfig)
+		return nil, err
+	}
+
+	topologyInformerFactory := topologyinformers.NewSharedInformerFactory(topoClient, 0)
+	nodeTopologyInformer := topologyInformerFactory.Topology().V1alpha1().NodeResourceTopologies()
+	informer := nodeTopologyInformer.Informer()
+
+	stopper := make(chan struct{})
+	topologyInfo := NewTopologyInfoMap(tcfg.Namespaces...)
+
+	if allowed := topologyInfo.GetAllowedNamespaces(); len(allowed) > 0 {
+		klog.InfoS("restricting NodeResourceTopology lookup", "namespaces", allowed)
+	} else {
+		klog.InfoS("cluster-wide NodeResourceTopology lookup")
+	}
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			nrt, ok := obj.(*topologyv1alpha1.NodeResourceTopology)
+			if !ok {
+				// TODO: more informative message
+				klog.V(5).InfoS("Unexpected object")
+				return
+			}
+			topologyInfo.TryAdd(nrt)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			nrt, ok := newObj.(*topologyv1alpha1.NodeResourceTopology)
+			if !ok {
+				// TODO: more informative message
+				klog.V(5).InfoS("Unexpected object")
+				return
+			}
+			topologyInfo.TryAdd(nrt)
+		},
+		DeleteFunc: func(obj interface{}) {
+			nrt, ok := obj.(*topologyv1alpha1.NodeResourceTopology)
+			if !ok {
+				// TODO: more informative message
+				klog.V(5).InfoS("Unexpected object")
+				return
+			}
+			topologyInfo.Remove(nrt)
+		},
+	})
+
+	klog.InfoS("Start NodeTopologyInformer")
+
+	go informer.Run(stopper)
+
+	klog.InfoS("Synching NodeTopologyInformer...")
+	if !cache.WaitForCacheSync(stopper, informer.HasSynced) {
+		return nil, fmt.Errorf("Timed out waiting for caches to sync")
+	}
+	klog.InfoS("Synched NodeTopologyInformer", "object count", topologyInfo.Len())
 
 	scoringFunction, err := getScoringStrategyFunction(tcfg.ScoringStrategy.Type)
 	if err != nil {
@@ -108,14 +175,17 @@ func New(args runtime.Object, handle framework.Handle) (framework.Plugin, error)
 
 	topologyMatch := &TopologyMatch{
 		nodeResTopologyPlugin: nodeResTopologyPlugin{
-			lister:     lister,
-			namespaces: tcfg.Namespaces,
+			factory:      topologyInformerFactory,
+			informer:     nodeTopologyInformer,
+			stopChan:     stopper,
+			topologyInfo: topologyInfo,
 		},
 		policyHandlers:      newPolicyHandlerMap(),
 		scorerFn:            scoringFunction,
 		resourceToWeightMap: resToWeightMap,
 	}
 
+	klog.InfoS("Plugin ready")
 	return topologyMatch, nil
 }
 

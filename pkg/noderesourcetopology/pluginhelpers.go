@@ -17,61 +17,79 @@ limitations under the License.
 package noderesourcetopology
 
 import (
-	"context"
 	"fmt"
+	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	topologyv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
-	topoclientset "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
-	topologyinformers "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions"
-	listerv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/listers/topology/v1alpha1"
 )
 
-func findNodeTopology(nodeName string, nodeResTopoPlugin *nodeResTopologyPlugin) *topologyv1alpha1.NodeResourceTopology {
-	klog.V(5).InfoS("Namespaces for nodeResTopoPlugin", "namespaces", nodeResTopoPlugin.namespaces)
-	for _, namespace := range nodeResTopoPlugin.namespaces {
-		klog.V(5).InfoS("Lister for nodeResTopoPlugin", "lister", nodeResTopoPlugin.lister)
-		// NodeTopology couldn't be placed in several namespaces simultaneously
-		lister := nodeResTopoPlugin.lister
-		nodeTopology, err := (*lister).NodeResourceTopologies(namespace).Get(nodeName)
-		if err != nil {
-			klog.V(5).ErrorS(err, "Cannot get NodeTopologies from NodeResourceTopologyNamespaceLister")
-			continue
-		}
-		if nodeTopology != nil {
-			return nodeTopology
-		}
-	}
-	return nil
+type TopologyInfoMap struct {
+	allowNs sets.String
+	lock    sync.RWMutex
+	info    map[string]*topologyv1alpha1.NodeResourceTopology
 }
 
-func initNodeTopologyInformer(masterOverride, kubeConfigPath *string) (*listerv1alpha1.NodeResourceTopologyLister, error) {
-	kubeConfig, err := clientcmd.BuildConfigFromFlags(*masterOverride, *kubeConfigPath)
-	if err != nil {
-		klog.ErrorS(err, "Cannot create kubeconfig", "masterOverride", *masterOverride, "kubeConfigPath", *kubeConfigPath)
-		return nil, err
+func NewTopologyInfoMap(allowNs ...string) *TopologyInfoMap {
+	return &TopologyInfoMap{
+		allowNs: sets.NewString(allowNs...),
+		info:    make(map[string]*topologyv1alpha1.NodeResourceTopology),
 	}
+}
 
-	topoClient, err := topoclientset.NewForConfig(kubeConfig)
-	if err != nil {
-		klog.ErrorS(err, "Cannot create clientset for NodeTopologyResource", "kubeConfig", kubeConfig)
-		return nil, err
+func (tim *TopologyInfoMap) GetAllowedNamespaces() []string {
+	return tim.allowNs.UnsortedList()
+}
+
+func (tim *TopologyInfoMap) IsAllowed(ns string) bool {
+	// empty allowlist: everyone is allowed! this is intentional
+	// no lock needed: allowNs is not changing past initialization
+	if tim.allowNs.Len() == 0 {
+		return true
 	}
+	return tim.allowNs.Has(ns)
+}
 
-	topologyInformerFactory := topologyinformers.NewSharedInformerFactory(topoClient, 0)
-	nodeTopologyInformer := topologyInformerFactory.Topology().V1alpha1().NodeResourceTopologies()
-	nodeResourceTopologyLister := nodeTopologyInformer.Lister()
+func (tim *TopologyInfoMap) TryAdd(obj *topologyv1alpha1.NodeResourceTopology) bool {
+	tim.lock.Lock()
+	defer tim.lock.Unlock()
+	if !tim.IsAllowed(obj.Namespace) {
+		return false
+	}
+	tim.info[obj.Name] = obj
+	return true
+}
 
-	klog.V(5).InfoS("Start nodeTopologyInformer")
-	ctx := context.Background()
-	topologyInformerFactory.Start(ctx.Done())
-	topologyInformerFactory.WaitForCacheSync(ctx.Done())
+func (tim *TopologyInfoMap) Add(obj *topologyv1alpha1.NodeResourceTopology) {
+	tim.lock.Lock()
+	defer tim.lock.Unlock()
+	tim.info[obj.Name] = obj
+}
 
-	return &nodeResourceTopologyLister, nil
+func (tim *TopologyInfoMap) Remove(obj *topologyv1alpha1.NodeResourceTopology) {
+	tim.lock.Lock()
+	defer tim.lock.Unlock()
+	delete(tim.info, obj.Name)
+}
+
+func (tim *TopologyInfoMap) Get(name string) *topologyv1alpha1.NodeResourceTopology {
+	tim.lock.RLock()
+	defer tim.lock.RUnlock()
+	obj, ok := tim.info[name]
+	if !ok {
+		return nil
+	}
+	return obj.DeepCopy()
+}
+
+func (tim *TopologyInfoMap) Len() int {
+	tim.lock.RLock()
+	defer tim.lock.RUnlock()
+	return len(tim.info)
 }
 
 func createNUMANodeList(zones topologyv1alpha1.ZoneList) NUMANodeList {

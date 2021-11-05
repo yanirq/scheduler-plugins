@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -127,7 +127,7 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState *framework.Cycle
 	}
 
 	nodeName := nodeInfo.Node().Name
-	nodeTopology := findNodeTopology(nodeName, &tm.nodeResTopologyPlugin)
+	nodeTopology := tm.topologyInfo.Get(nodeName)
 
 	if nodeTopology == nil {
 		return nil
